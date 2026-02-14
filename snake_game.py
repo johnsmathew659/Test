@@ -10,9 +10,14 @@ Run headless simulation:
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import tkinter as tk
 from dataclasses import dataclass
+from pathlib import Path
+
+
+SCORES_FILE = Path(__file__).with_name("snake_scores.json")
 
 
 @dataclass(frozen=True)
@@ -21,18 +26,60 @@ class Point:
     y: int
 
 
+class ScoreBoard:
+    def __init__(self, path: Path, keep: int = 10) -> None:
+        self.path = path
+        self.keep = keep
+        self.scores = self._load()
+
+    def _load(self) -> list[int]:
+        if not self.path.exists():
+            return []
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(data, list):
+                return []
+            values = [int(v) for v in data if isinstance(v, int) or (isinstance(v, str) and v.isdigit())]
+            values.sort(reverse=True)
+            return values[: self.keep]
+        except (OSError, json.JSONDecodeError, ValueError):
+            return []
+
+    def _save(self) -> None:
+        try:
+            self.path.write_text(json.dumps(self.scores, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    def add(self, score: int) -> None:
+        if score < 0:
+            return
+        self.scores.append(score)
+        self.scores.sort(reverse=True)
+        self.scores = self.scores[: self.keep]
+        self._save()
+
+    def clear(self) -> None:
+        self.scores = []
+        self._save()
+
+    def best(self) -> int:
+        return self.scores[0] if self.scores else 0
+
+
 class SnakeEngine:
     """Game rules/state that can run with or without a GUI."""
 
     GRID_WIDTH = 28
     GRID_HEIGHT = 20
     START_DELAY_MS = 140
-    MIN_DELAY_MS = 70
+    MIN_DELAY_MS = 65
     SPEEDUP_EVERY = 4
     SPEED_STEP_MS = 7
 
-    def __init__(self) -> None:
-        self.best_score = 0
+    def __init__(self, wrap_walls: bool = True, speed_factor: float = 1.0) -> None:
+        self.wrap_walls = wrap_walls
+        self.speed_factor = max(0.25, min(speed_factor, 3.0))
         self.reset_state()
 
     def reset_state(self) -> None:
@@ -42,13 +89,26 @@ class SnakeEngine:
         self.pending_direction = self.direction
         self.food = self.spawn_food()
         self.score = 0
-        self.tick_delay = self.START_DELAY_MS
         self.running = False
         self.game_over = False
+        self._base_tick_delay = int(self.START_DELAY_MS / self.speed_factor)
+        self.tick_delay = self._base_tick_delay
 
     def start(self) -> None:
         if not self.game_over:
             self.running = True
+
+    def stop(self) -> None:
+        self.running = False
+
+    def set_speed_factor(self, factor: float) -> None:
+        self.speed_factor = max(0.25, min(factor, 3.0))
+        score_steps = self.score // self.SPEEDUP_EVERY
+        self._base_tick_delay = int(self.START_DELAY_MS / self.speed_factor)
+        self.tick_delay = max(
+            int(self.MIN_DELAY_MS / self.speed_factor),
+            self._base_tick_delay - score_steps * self.SPEED_STEP_MS,
+        )
 
     def set_direction(self, dx: int, dy: int) -> None:
         if self.game_over:
@@ -68,25 +128,21 @@ class SnakeEngine:
             if p not in occupied:
                 return p
 
+    def _wrap(self, p: Point) -> Point:
+        return Point(p.x % self.GRID_WIDTH, p.y % self.GRID_HEIGHT)
+
     def step(self) -> bool:
-        """Advance one tick. Returns True if game continues."""
         if not self.running:
             return not self.game_over
 
         self.direction = self.pending_direction
         head = self.snake[0]
-        new_head = Point(head.x + self.direction[0], head.y + self.direction[1])
+        candidate = Point(head.x + self.direction[0], head.y + self.direction[1])
+        new_head = self._wrap(candidate) if self.wrap_walls else candidate
 
-        if (
-            new_head.x < 0
-            or new_head.x >= self.GRID_WIDTH
-            or new_head.y < 0
-            or new_head.y >= self.GRID_HEIGHT
-            or new_head in self.snake
-        ):
+        if (not self.wrap_walls and (new_head.x < 0 or new_head.x >= self.GRID_WIDTH or new_head.y < 0 or new_head.y >= self.GRID_HEIGHT)) or new_head in self.snake:
             self.running = False
             self.game_over = True
-            self.best_score = max(self.best_score, self.score)
             return False
 
         self.snake.insert(0, new_head)
@@ -95,7 +151,10 @@ class SnakeEngine:
             self.score += 1
             self.food = self.spawn_food()
             if self.score % self.SPEEDUP_EVERY == 0:
-                self.tick_delay = max(self.MIN_DELAY_MS, self.tick_delay - self.SPEED_STEP_MS)
+                self.tick_delay = max(
+                    int(self.MIN_DELAY_MS / self.speed_factor),
+                    self.tick_delay - self.SPEED_STEP_MS,
+                )
         else:
             self.snake.pop()
 
@@ -108,6 +167,7 @@ class SnakeGUI:
     GRID_COLOR = "#1F2937"
     SNAKE_HEAD = "#34D399"
     SNAKE_BODY = "#10B981"
+    SNAKE_TAIL = "#059669"
     FOOD_COLOR = "#F87171"
     PANEL_BG = "#0B1220"
     TEXT_COLOR = "#E5E7EB"
@@ -115,7 +175,8 @@ class SnakeGUI:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.engine = SnakeEngine()
+        self.engine = SnakeEngine(wrap_walls=True)
+        self.scores = ScoreBoard(SCORES_FILE)
 
         self.root.title("Snake")
         self.root.configure(bg=self.PANEL_BG)
@@ -144,49 +205,104 @@ class SnakeGUI:
             bg=self.BACKGROUND,
             highlightthickness=0,
         )
-        self.canvas.grid(row=1, column=0, rowspan=3, padx=(0, 16))
+        self.canvas.grid(row=1, column=0, rowspan=6, padx=(0, 16))
 
         sidebar = tk.Frame(frame, bg=self.PANEL_BG)
         sidebar.grid(row=1, column=1, sticky="n")
 
         self.score_var = tk.StringVar(value="Score: 0")
-        self.best_var = tk.StringVar(value="Best: 0")
-        self.state_var = tk.StringVar(value="Press SPACE to start")
+        self.best_var = tk.StringVar(value=f"Best: {self.scores.best()}")
+        self.state_var = tk.StringVar(value="Press SPACE or Start")
+        self.speed_var = tk.DoubleVar(value=1.0)
 
         self._info_label(sidebar, self.score_var, 0)
         self._info_label(sidebar, self.best_var, 1)
-        self._info_label(sidebar, self.state_var, 2, wrap=190)
+        self._info_label(sidebar, self.state_var, 2, wrap=210)
 
         controls = tk.Label(
             sidebar,
-            text="Controls\n↑ ↓ ← → or WASD\nSPACE = start/restart",
+            text="Controls\n↑ ↓ ← → or WASD\nSPACE = start/pause",
             font=("Segoe UI", 11),
             justify="left",
             bg=self.PANEL_BG,
             fg="#9CA3AF",
-            pady=18,
+            pady=14,
         )
         controls.grid(row=3, column=0, sticky="w")
 
-        self.restart_btn = tk.Button(
+        speed_label = tk.Label(
             sidebar,
-            text="Restart",
-            command=self.restart,
+            text="Speed",
             font=("Segoe UI", 11, "bold"),
+            bg=self.PANEL_BG,
+            fg=self.TEXT_COLOR,
+        )
+        speed_label.grid(row=4, column=0, sticky="w", pady=(2, 0))
+
+        speed_scale = tk.Scale(
+            sidebar,
+            from_=0.5,
+            to=2.5,
+            resolution=0.1,
+            orient="horizontal",
+            length=190,
+            variable=self.speed_var,
+            command=self.on_speed_change,
+            bg=self.PANEL_BG,
+            fg=self.TEXT_COLOR,
+            troughcolor="#374151",
+            highlightthickness=0,
+        )
+        speed_scale.grid(row=5, column=0, sticky="w")
+
+        self.start_stop_btn = self._btn(sidebar, "Start", self.toggle_running, row=6, col=0)
+        self.restart_btn = self._btn(sidebar, "Restart", self.restart, row=7, col=0)
+        self.clear_scores_btn = self._btn(sidebar, "Clear Top Scores", self.clear_scores, row=8, col=0)
+
+        top_title = tk.Label(
+            sidebar,
+            text="Top Scores",
+            font=("Segoe UI", 11, "bold"),
+            bg=self.PANEL_BG,
+            fg=self.TEXT_COLOR,
+            pady=8,
+        )
+        top_title.grid(row=9, column=0, sticky="w")
+
+        self.top_scores_text = tk.Text(
+            sidebar,
+            width=24,
+            height=8,
+            bg="#111827",
+            fg="#D1D5DB",
+            relief="flat",
+            font=("Consolas", 10),
+        )
+        self.top_scores_text.grid(row=10, column=0, sticky="w")
+        self.top_scores_text.configure(state="disabled")
+
+        self.after_id: str | None = None
+        self.refresh_top_scores()
+        self.bind_keys()
+        self.draw()
+
+    def _btn(self, parent: tk.Widget, text: str, command, row: int, col: int) -> tk.Button:
+        btn = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            font=("Segoe UI", 10, "bold"),
             bg=self.ACCENT,
             fg="#0B1220",
             activebackground="#93C5FD",
             activeforeground="#0B1220",
             relief="flat",
-            padx=16,
-            pady=8,
+            padx=12,
+            pady=7,
             cursor="hand2",
         )
-        self.restart_btn.grid(row=4, column=0, sticky="w")
-
-        self.after_id: str | None = None
-        self.bind_keys()
-        self.draw()
+        btn.grid(row=row, column=col, sticky="w", pady=3)
+        return btn
 
     def _info_label(self, parent: tk.Widget, var: tk.StringVar, row: int, wrap: int = 0) -> None:
         label = tk.Label(
@@ -195,7 +311,7 @@ class SnakeGUI:
             font=("Segoe UI", 13, "bold") if row < 2 else ("Segoe UI", 12),
             bg=self.PANEL_BG,
             fg=self.TEXT_COLOR,
-            pady=6,
+            pady=5,
             wraplength=wrap,
             justify="left",
         )
@@ -210,45 +326,83 @@ class SnakeGUI:
         self.root.bind("s", lambda _: self.set_direction(0, 1))
         self.root.bind("a", lambda _: self.set_direction(-1, 0))
         self.root.bind("d", lambda _: self.set_direction(1, 0))
-        self.root.bind("<space>", lambda _: self.space_action())
+        self.root.bind("<space>", lambda _: self.toggle_running())
+
+    def on_speed_change(self, _: str) -> None:
+        self.engine.set_speed_factor(self.speed_var.get())
 
     def set_direction(self, dx: int, dy: int) -> None:
         self.engine.set_direction(dx, dy)
         if not self.engine.running and not self.engine.game_over:
-            self.engine.start()
-            self.state_var.set("Good luck!")
+            self.start_game()
+
+    def start_game(self) -> None:
+        self.engine.start()
+        self.start_stop_btn.configure(text="Pause")
+        self.state_var.set("Running...")
+        if self.after_id is None:
             self.tick()
+
+    def pause_game(self) -> None:
+        self.engine.stop()
+        self.start_stop_btn.configure(text="Start")
+        self.state_var.set("Paused")
+        if self.after_id:
+            self.root.after_cancel(self.after_id)
+            self.after_id = None
+
+    def toggle_running(self) -> None:
+        if self.engine.game_over:
+            self.restart()
+        if self.engine.running:
+            self.pause_game()
+        else:
+            self.start_game()
 
     def restart(self) -> None:
         if self.after_id:
             self.root.after_cancel(self.after_id)
             self.after_id = None
         self.engine.reset_state()
+        self.engine.set_speed_factor(self.speed_var.get())
         self.score_var.set("Score: 0")
-        self.best_var.set(f"Best: {self.engine.best_score}")
-        self.state_var.set("Press SPACE to start")
+        self.best_var.set(f"Best: {self.scores.best()}")
+        self.state_var.set("Press SPACE or Start")
+        self.start_stop_btn.configure(text="Start")
         self.draw()
 
-    def space_action(self) -> None:
-        if self.engine.game_over:
-            self.restart()
-        if not self.engine.running:
-            self.engine.start()
-            self.state_var.set("Good luck!")
-            self.tick()
+    def clear_scores(self) -> None:
+        self.scores.clear()
+        self.best_var.set("Best: 0")
+        self.refresh_top_scores()
+
+    def refresh_top_scores(self) -> None:
+        lines = [f"{i+1:>2}. {s}" for i, s in enumerate(self.scores.scores)]
+        if not lines:
+            lines = ["No scores yet."]
+
+        self.top_scores_text.configure(state="normal")
+        self.top_scores_text.delete("1.0", "end")
+        self.top_scores_text.insert("end", "\n".join(lines))
+        self.top_scores_text.configure(state="disabled")
 
     def tick(self) -> None:
+        self.after_id = None
         ongoing = self.engine.step()
         self.score_var.set(f"Score: {self.engine.score}")
-        self.best_var.set(f"Best: {self.engine.best_score}")
 
         if not ongoing:
-            self.state_var.set("Game over — press SPACE to restart")
+            self.scores.add(self.engine.score)
+            self.best_var.set(f"Best: {self.scores.best()}")
+            self.refresh_top_scores()
+            self.state_var.set("Game over — press Start/SPACE")
+            self.start_stop_btn.configure(text="Start")
             self.draw()
             return
 
         self.draw()
-        self.after_id = self.root.after(self.engine.tick_delay, self.tick)
+        if self.engine.running:
+            self.after_id = self.root.after(self.engine.tick_delay, self.tick)
 
     def draw(self) -> None:
         self.canvas.delete("all")
@@ -259,29 +413,29 @@ class SnakeGUI:
             self.canvas.create_line(0, y, self.canvas_width, y, fill=self.GRID_COLOR)
 
         fx, fy = self.engine.food.x * self.CELL_SIZE, self.engine.food.y * self.CELL_SIZE
-        pad = 5
         self.canvas.create_oval(
-            fx + pad,
-            fy + pad,
-            fx + self.CELL_SIZE - pad,
-            fy + self.CELL_SIZE - pad,
+            fx + 5,
+            fy + 5,
+            fx + self.CELL_SIZE - 5,
+            fy + self.CELL_SIZE - 5,
             fill=self.FOOD_COLOR,
             outline="",
         )
 
-        for i, part in enumerate(self.engine.snake):
-            x1 = part.x * self.CELL_SIZE + 2
-            y1 = part.y * self.CELL_SIZE + 2
-            x2 = x1 + self.CELL_SIZE - 4
-            y2 = y1 + self.CELL_SIZE - 4
-            self.canvas.create_rectangle(
-                x1,
-                y1,
-                x2,
-                y2,
-                fill=self.SNAKE_HEAD if i == 0 else self.SNAKE_BODY,
-                outline="",
-            )
+        snake = self.engine.snake
+        for i, part in enumerate(snake):
+            x1 = part.x * self.CELL_SIZE + 3
+            y1 = part.y * self.CELL_SIZE + 3
+            x2 = x1 + self.CELL_SIZE - 6
+            y2 = y1 + self.CELL_SIZE - 6
+
+            if i == 0:
+                self.canvas.create_oval(x1, y1, x2, y2, fill=self.SNAKE_HEAD, outline="")
+                self._draw_eyes(part)
+            elif i == len(snake) - 1:
+                self.canvas.create_oval(x1 + 4, y1 + 4, x2 - 4, y2 - 4, fill=self.SNAKE_TAIL, outline="")
+            else:
+                self.canvas.create_oval(x1, y1, x2, y2, fill=self.SNAKE_BODY, outline="")
 
         if self.engine.game_over:
             self.canvas.create_rectangle(
@@ -295,7 +449,7 @@ class SnakeGUI:
             )
             self.canvas.create_text(
                 self.canvas_width // 2,
-                self.canvas_height // 2 - 12,
+                self.canvas_height // 2 - 10,
                 text="Game Over",
                 font=("Segoe UI", 28, "bold"),
                 fill="#F9FAFB",
@@ -303,21 +457,43 @@ class SnakeGUI:
             self.canvas.create_text(
                 self.canvas_width // 2,
                 self.canvas_height // 2 + 24,
-                text="Press SPACE to restart",
+                text="Start or SPACE to restart",
                 font=("Segoe UI", 14),
                 fill="#D1D5DB",
             )
 
+    def _draw_eyes(self, head: Point) -> None:
+        dx, dy = self.engine.direction
+        base_x = head.x * self.CELL_SIZE
+        base_y = head.y * self.CELL_SIZE
 
-def run_headless(steps: int, seed: int | None = None) -> None:
-    """Run a simple automated, non-GUI simulation for CI/servers."""
+        if dx == 1:
+            eyes = [(20, 9), (20, 18)]
+        elif dx == -1:
+            eyes = [(8, 9), (8, 18)]
+        elif dy == 1:
+            eyes = [(9, 20), (18, 20)]
+        else:
+            eyes = [(9, 8), (18, 8)]
+
+        for ex, ey in eyes:
+            self.canvas.create_oval(
+                base_x + ex,
+                base_y + ey,
+                base_x + ex + 4,
+                base_y + ey + 4,
+                fill="#111827",
+                outline="",
+            )
+
+
+def run_headless(steps: int, seed: int | None = None, speed: float = 1.0) -> None:
     if seed is not None:
         random.seed(seed)
 
-    engine = SnakeEngine()
+    engine = SnakeEngine(wrap_walls=True, speed_factor=speed)
     engine.start()
 
-    # Basic auto-pilot: prefer food direction unless blocked, otherwise rotate options.
     directions = [(1, 0), (0, 1), (-1, 0), (0, -1)]
     for _ in range(steps):
         if engine.game_over:
@@ -339,10 +515,9 @@ def run_headless(steps: int, seed: int | None = None) -> None:
                 preferred.append(d)
 
         for dx, dy in preferred:
-            nx = head.x + dx
-            ny = head.y + dy
-            candidate = Point(nx, ny)
-            if 0 <= nx < engine.GRID_WIDTH and 0 <= ny < engine.GRID_HEIGHT and candidate not in engine.snake:
+            nx = (head.x + dx) % engine.GRID_WIDTH
+            ny = (head.y + dy) % engine.GRID_HEIGHT
+            if Point(nx, ny) not in engine.snake:
                 engine.set_direction(dx, dy)
                 break
 
@@ -357,13 +532,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--headless", action="store_true", help="Run without GUI using an auto-player.")
     parser.add_argument("--steps", type=int, default=200, help="Steps to run in headless mode.")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for headless reproducibility.")
+    parser.add_argument("--speed", type=float, default=1.0, help="Speed multiplier (0.5 to 2.5+).")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     if args.headless:
-        run_headless(steps=args.steps, seed=args.seed)
+        run_headless(steps=args.steps, seed=args.seed, speed=args.speed)
         return
 
     root = tk.Tk()
