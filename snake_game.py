@@ -1,11 +1,15 @@
-"""Classic Snake game with a polished Tkinter GUI.
+"""Classic Snake game with GUI and optional headless mode.
 
-Run:
+Run GUI (default):
     python snake_game.py
+
+Run headless simulation:
+    python snake_game.py --headless --steps 200
 """
 
 from __future__ import annotations
 
+import argparse
 import random
 import tkinter as tk
 from dataclasses import dataclass
@@ -17,11 +21,89 @@ class Point:
     y: int
 
 
-class SnakeGame:
+class SnakeEngine:
+    """Game rules/state that can run with or without a GUI."""
+
     GRID_WIDTH = 28
     GRID_HEIGHT = 20
-    CELL_SIZE = 28
+    START_DELAY_MS = 140
+    MIN_DELAY_MS = 70
+    SPEEDUP_EVERY = 4
+    SPEED_STEP_MS = 7
 
+    def __init__(self) -> None:
+        self.best_score = 0
+        self.reset_state()
+
+    def reset_state(self) -> None:
+        cx, cy = self.GRID_WIDTH // 2, self.GRID_HEIGHT // 2
+        self.snake = [Point(cx, cy), Point(cx - 1, cy), Point(cx - 2, cy)]
+        self.direction = (1, 0)
+        self.pending_direction = self.direction
+        self.food = self.spawn_food()
+        self.score = 0
+        self.tick_delay = self.START_DELAY_MS
+        self.running = False
+        self.game_over = False
+
+    def start(self) -> None:
+        if not self.game_over:
+            self.running = True
+
+    def set_direction(self, dx: int, dy: int) -> None:
+        if self.game_over:
+            return
+        curr_dx, curr_dy = self.direction
+        if (dx, dy) == (-curr_dx, -curr_dy):
+            return
+        self.pending_direction = (dx, dy)
+
+    def spawn_food(self) -> Point:
+        occupied = set(self.snake)
+        while True:
+            p = Point(
+                random.randint(0, self.GRID_WIDTH - 1),
+                random.randint(0, self.GRID_HEIGHT - 1),
+            )
+            if p not in occupied:
+                return p
+
+    def step(self) -> bool:
+        """Advance one tick. Returns True if game continues."""
+        if not self.running:
+            return not self.game_over
+
+        self.direction = self.pending_direction
+        head = self.snake[0]
+        new_head = Point(head.x + self.direction[0], head.y + self.direction[1])
+
+        if (
+            new_head.x < 0
+            or new_head.x >= self.GRID_WIDTH
+            or new_head.y < 0
+            or new_head.y >= self.GRID_HEIGHT
+            or new_head in self.snake
+        ):
+            self.running = False
+            self.game_over = True
+            self.best_score = max(self.best_score, self.score)
+            return False
+
+        self.snake.insert(0, new_head)
+
+        if new_head == self.food:
+            self.score += 1
+            self.food = self.spawn_food()
+            if self.score % self.SPEEDUP_EVERY == 0:
+                self.tick_delay = max(self.MIN_DELAY_MS, self.tick_delay - self.SPEED_STEP_MS)
+        else:
+            self.snake.pop()
+
+        return True
+
+
+class SnakeGUI:
+    CELL_SIZE = 28
     BACKGROUND = "#111827"
     GRID_COLOR = "#1F2937"
     SNAKE_HEAD = "#34D399"
@@ -31,19 +113,16 @@ class SnakeGame:
     TEXT_COLOR = "#E5E7EB"
     ACCENT = "#60A5FA"
 
-    START_DELAY_MS = 140
-    MIN_DELAY_MS = 70
-    SPEEDUP_EVERY = 4
-    SPEED_STEP_MS = 7
-
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
+        self.engine = SnakeEngine()
+
         self.root.title("Snake")
         self.root.configure(bg=self.PANEL_BG)
         self.root.resizable(False, False)
 
-        self.canvas_width = self.GRID_WIDTH * self.CELL_SIZE
-        self.canvas_height = self.GRID_HEIGHT * self.CELL_SIZE
+        self.canvas_width = self.engine.GRID_WIDTH * self.CELL_SIZE
+        self.canvas_height = self.engine.GRID_HEIGHT * self.CELL_SIZE
 
         frame = tk.Frame(root, bg=self.PANEL_BG, padx=18, pady=18)
         frame.pack()
@@ -105,11 +184,8 @@ class SnakeGame:
         )
         self.restart_btn.grid(row=4, column=0, sticky="w")
 
-        self.best_score = 0
         self.after_id: str | None = None
-
         self.bind_keys()
-        self.reset_state()
         self.draw()
 
     def _info_label(self, parent: tk.Widget, var: tk.StringVar, row: int, wrap: int = 0) -> None:
@@ -130,101 +206,49 @@ class SnakeGame:
         self.root.bind("<Down>", lambda _: self.set_direction(0, 1))
         self.root.bind("<Left>", lambda _: self.set_direction(-1, 0))
         self.root.bind("<Right>", lambda _: self.set_direction(1, 0))
-
         self.root.bind("w", lambda _: self.set_direction(0, -1))
         self.root.bind("s", lambda _: self.set_direction(0, 1))
         self.root.bind("a", lambda _: self.set_direction(-1, 0))
         self.root.bind("d", lambda _: self.set_direction(1, 0))
-
         self.root.bind("<space>", lambda _: self.space_action())
 
-    def reset_state(self) -> None:
-        cx, cy = self.GRID_WIDTH // 2, self.GRID_HEIGHT // 2
-        self.snake = [Point(cx, cy), Point(cx - 1, cy), Point(cx - 2, cy)]
-        self.direction = (1, 0)
-        self.pending_direction = self.direction
-        self.food = self.spawn_food()
-        self.score = 0
-        self.tick_delay = self.START_DELAY_MS
-        self.running = False
-        self.game_over = False
-        self.score_var.set("Score: 0")
-        self.best_var.set(f"Best: {self.best_score}")
-        self.state_var.set("Press SPACE to start")
+    def set_direction(self, dx: int, dy: int) -> None:
+        self.engine.set_direction(dx, dy)
+        if not self.engine.running and not self.engine.game_over:
+            self.engine.start()
+            self.state_var.set("Good luck!")
+            self.tick()
 
     def restart(self) -> None:
         if self.after_id:
             self.root.after_cancel(self.after_id)
             self.after_id = None
-        self.reset_state()
+        self.engine.reset_state()
+        self.score_var.set("Score: 0")
+        self.best_var.set(f"Best: {self.engine.best_score}")
+        self.state_var.set("Press SPACE to start")
         self.draw()
 
     def space_action(self) -> None:
-        if self.game_over:
+        if self.engine.game_over:
             self.restart()
-        if not self.running:
-            self.running = True
+        if not self.engine.running:
+            self.engine.start()
             self.state_var.set("Good luck!")
             self.tick()
-
-    def set_direction(self, dx: int, dy: int) -> None:
-        if self.game_over:
-            return
-        curr_dx, curr_dy = self.direction
-        if (dx, dy) == (-curr_dx, -curr_dy):
-            return
-        self.pending_direction = (dx, dy)
-        if not self.running:
-            self.running = True
-            self.state_var.set("Good luck!")
-            self.tick()
-
-    def spawn_food(self) -> Point:
-        occupied = set(self.snake)
-        while True:
-            p = Point(
-                random.randint(0, self.GRID_WIDTH - 1),
-                random.randint(0, self.GRID_HEIGHT - 1),
-            )
-            if p not in occupied:
-                return p
 
     def tick(self) -> None:
-        if not self.running:
-            return
+        ongoing = self.engine.step()
+        self.score_var.set(f"Score: {self.engine.score}")
+        self.best_var.set(f"Best: {self.engine.best_score}")
 
-        self.direction = self.pending_direction
-        head = self.snake[0]
-        new_head = Point(head.x + self.direction[0], head.y + self.direction[1])
-
-        if (
-            new_head.x < 0
-            or new_head.x >= self.GRID_WIDTH
-            or new_head.y < 0
-            or new_head.y >= self.GRID_HEIGHT
-            or new_head in self.snake
-        ):
-            self.running = False
-            self.game_over = True
-            self.best_score = max(self.best_score, self.score)
-            self.best_var.set(f"Best: {self.best_score}")
+        if not ongoing:
             self.state_var.set("Game over — press SPACE to restart")
             self.draw()
             return
 
-        self.snake.insert(0, new_head)
-
-        if new_head == self.food:
-            self.score += 1
-            self.score_var.set(f"Score: {self.score}")
-            self.food = self.spawn_food()
-            if self.score % self.SPEEDUP_EVERY == 0:
-                self.tick_delay = max(self.MIN_DELAY_MS, self.tick_delay - self.SPEED_STEP_MS)
-        else:
-            self.snake.pop()
-
         self.draw()
-        self.after_id = self.root.after(self.tick_delay, self.tick)
+        self.after_id = self.root.after(self.engine.tick_delay, self.tick)
 
     def draw(self) -> None:
         self.canvas.delete("all")
@@ -234,7 +258,7 @@ class SnakeGame:
         for y in range(0, self.canvas_height + 1, self.CELL_SIZE):
             self.canvas.create_line(0, y, self.canvas_width, y, fill=self.GRID_COLOR)
 
-        fx, fy = self.food.x * self.CELL_SIZE, self.food.y * self.CELL_SIZE
+        fx, fy = self.engine.food.x * self.CELL_SIZE, self.engine.food.y * self.CELL_SIZE
         pad = 5
         self.canvas.create_oval(
             fx + pad,
@@ -245,7 +269,7 @@ class SnakeGame:
             outline="",
         )
 
-        for i, part in enumerate(self.snake):
+        for i, part in enumerate(self.engine.snake):
             x1 = part.x * self.CELL_SIZE + 2
             y1 = part.y * self.CELL_SIZE + 2
             x2 = x1 + self.CELL_SIZE - 4
@@ -259,7 +283,7 @@ class SnakeGame:
                 outline="",
             )
 
-        if self.game_over:
+        if self.engine.game_over:
             self.canvas.create_rectangle(
                 0,
                 self.canvas_height // 2 - 46,
@@ -285,9 +309,65 @@ class SnakeGame:
             )
 
 
+def run_headless(steps: int, seed: int | None = None) -> None:
+    """Run a simple automated, non-GUI simulation for CI/servers."""
+    if seed is not None:
+        random.seed(seed)
+
+    engine = SnakeEngine()
+    engine.start()
+
+    # Basic auto-pilot: prefer food direction unless blocked, otherwise rotate options.
+    directions = [(1, 0), (0, 1), (-1, 0), (0, -1)]
+    for _ in range(steps):
+        if engine.game_over:
+            break
+
+        head = engine.snake[0]
+        preferred: list[tuple[int, int]] = []
+        if engine.food.x > head.x:
+            preferred.append((1, 0))
+        elif engine.food.x < head.x:
+            preferred.append((-1, 0))
+        if engine.food.y > head.y:
+            preferred.append((0, 1))
+        elif engine.food.y < head.y:
+            preferred.append((0, -1))
+
+        for d in directions:
+            if d not in preferred:
+                preferred.append(d)
+
+        for dx, dy in preferred:
+            nx = head.x + dx
+            ny = head.y + dy
+            candidate = Point(nx, ny)
+            if 0 <= nx < engine.GRID_WIDTH and 0 <= ny < engine.GRID_HEIGHT and candidate not in engine.snake:
+                engine.set_direction(dx, dy)
+                break
+
+        engine.step()
+
+    status = "GAME_OVER" if engine.game_over else "RUNNING"
+    print(f"headless_status={status} score={engine.score} length={len(engine.snake)} steps={steps}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Classic Snake game (GUI or headless mode).")
+    parser.add_argument("--headless", action="store_true", help="Run without GUI using an auto-player.")
+    parser.add_argument("--steps", type=int, default=200, help="Steps to run in headless mode.")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for headless reproducibility.")
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+    if args.headless:
+        run_headless(steps=args.steps, seed=args.seed)
+        return
+
     root = tk.Tk()
-    SnakeGame(root)
+    SnakeGUI(root)
     root.mainloop()
 
 
